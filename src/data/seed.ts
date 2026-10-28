@@ -49,6 +49,7 @@ export function seedEvents(): EventRecord[] {
       status: 'on_sale',
       pricingType: 'standard',
       sectorPrices: { PIT: 49.9, A: 69.9, B: 39.9 },
+      earlyBird: { tickets: 500, discountRate: 0.2 },
     },
     {
       id: 'e-2',

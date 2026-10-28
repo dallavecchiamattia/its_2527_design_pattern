@@ -20,6 +20,13 @@ export type PricingType = 'standard' | 'flat' | 'free';
 
 export type EventStatus = 'draft' | 'on_sale' | 'cancelled';
 
+export interface EarlyBirdRule {
+  // Quanti biglietti vendibili al prezzo scontato.
+  tickets: number;
+  // Sconto sul prezzo di listino: 0.2 = -20%.
+  discountRate: number;
+}
+
 export interface EventRecord {
   id: string;
   title: string;
@@ -31,6 +38,7 @@ export interface EventRecord {
   pricingType: PricingType;
   sectorPrices: Record<string, number>;
   flatPrice?: number;
+  earlyBird?: EarlyBirdRule;
 }
 
 export interface User {
