@@ -5,25 +5,26 @@ import {
   Controller,
   Get,
   Headers,
-  HttpException, NotFoundException,
+  HttpException,
+  NotFoundException,
   Param,
   Post,
-  ServiceUnavailableException
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ApiHeader } from '@nestjs/swagger';
 import { type AlphaCharge, AlphaPayClient, AlphaTimeoutError } from '../../vendor/alpha-pay';
 import { EventsRepository } from '../data/events.repository';
 import { OrdersRepository } from '../data/orders.repository';
 import { TicketsRepository } from '../data/tickets.repository';
-import type { Order } from '../data/types';
+import type { Order, OrderItem, Seat } from '../data/types';
 import { UsersRepository } from '../data/users.repository';
 import { VenuesRepository } from '../data/venues.repository';
 import { SeatInventory } from '../inventory/seat-inventory';
 import { MailerService } from '../notifications/mailer.service';
+import { earlyBirdPrice, earlyBirdRemaining } from '../shared/early-bird';
+import { round2 } from '../shared/money';
 import { TicketsService } from '../tickets/tickets.service';
 import { CreateOrderDto } from './create-order.dto';
-import { OrderPricer, SeatRequest } from '../pricing/order-pricer';
-import { PricingRuleRegistry } from '../pricing/pricing-rules-registry';
 
 @Controller('orders')
 export class OrdersController {
@@ -35,8 +36,19 @@ export class OrdersController {
     private readonly tickets: TicketsRepository,
     private readonly ticketsService: TicketsService,
     private readonly mailer: MailerService,
-    private readonly ruleRegistry: PricingRuleRegistry
   ) {}
+
+  private buildItem(seat: Seat, quantity: number, unitPrice: number): OrderItem {
+    const fee = round2(unitPrice * 0.12);
+    let lineTotal: number;
+    if (seat.kind === 'standing') {
+      // per i posti in piedi la commissione si calcola direttamente sul totale, il risultato è lo stesso
+      lineTotal = round2(unitPrice * quantity * 1.12);
+    } else {
+      lineTotal = round2(unitPrice + fee);
+    }
+    return { seatId: seat.id, sector: seat.sector, quantity, unitPrice, fee, lineTotal };
+  }
 
   @Post()
   @ApiHeader({
@@ -55,7 +67,8 @@ export class OrdersController {
     if (!body.seats || body.seats.length === 0) throw new BadRequestException('nessun posto selezionato');
 
     const inventory = SeatInventory.getInstance();
-    const requests: SeatRequest[] = [];
+    const items: OrderItem[] = [];
+    let soldBefore = this.orders.countSoldTickets(event.id);
     for (const requested of body.seats) {
       const seat = venue.seats.find((s) => s.id === requested.seatId);
       if (!seat) throw new BadRequestException('posto inesistente: ' + requested.seatId);
@@ -68,12 +81,38 @@ export class OrdersController {
           throw new ConflictException('settore esaurito: ' + seat.sector);
         }
       }
-      requests.push({ seat, quantity: qty })
-    }
 
-    
-    const rule = this.ruleRegistry.forEvent(event);
-    const { items, total } = new OrderPricer(rule).quote(event, requests);
+      // prezzo di listino del settore
+      let listPrice = 0;
+      switch (event.pricingType) {
+        case 'standard':
+          listPrice = event.sectorPrices[seat.sector];
+          break;
+        case 'flat':
+          listPrice = event.flatPrice!;
+          break;
+        case 'free':
+          listPrice = 0;
+          break;
+        default:
+          throw new BadRequestException('tipo di prezzo non gestito');
+      }
+
+      // l'ordine può scavalcare la soglia: solo i biglietti oltre il limite
+      // pagano il prezzo pieno.
+      const earlyBirdQty = Math.min(qty, earlyBirdRemaining(event, soldBefore));
+      const fullPriceQty = qty - earlyBirdQty;
+      if (earlyBirdQty > 0) {
+        items.push(this.buildItem(seat, earlyBirdQty, earlyBirdPrice(event, listPrice)));
+      }
+      if (fullPriceQty > 0) {
+        items.push(this.buildItem(seat, fullPriceQty, listPrice));
+      }
+      soldBefore += qty;
+    }
+    let total = 0;
+    for (const it of items) total += it.lineTotal;
+    total = round2(total);
 
     // pagamento
     let charge: AlphaCharge | null = null;
