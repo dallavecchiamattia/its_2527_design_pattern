@@ -11,7 +11,8 @@ import {
   ServiceUnavailableException
 } from '@nestjs/common';
 import { ApiHeader } from '@nestjs/swagger';
-import { type AlphaCharge, AlphaPayClient, AlphaTimeoutError } from '../../vendor/alpha-pay';
+import { AlphaPayClient, AlphaTimeoutError } from '../../vendor/alpha-pay';
+import { BetaPayments } from '../../vendor/beta-pay';
 import { EventsRepository } from '../data/events.repository';
 import { OrdersRepository } from '../data/orders.repository';
 import { TicketsRepository } from '../data/tickets.repository';
@@ -38,6 +39,9 @@ export class OrdersController {
     private readonly ruleRegistry: PricingRuleRegistry,
     private readonly inventory: SeatInventory
   ) {}
+
+  // il provider si sceglie all'avvio, non a ogni richiesta
+  private readonly provider = process.env.PAYMENT_PROVIDER === 'beta' ? 'beta' : 'alpha';
 
   @Post()
   @ApiHeader({
@@ -76,31 +80,45 @@ export class OrdersController {
     const { items, total } = new OrderPricer(rule).quote(event, requests);
 
     // pagamento
-    let charge: AlphaCharge | null = null;
+    let paymentId: string | null = null;
     if (total > 0) {
-      const alpha = new AlphaPayClient(process.env.ALPHA_API_KEY ?? 'sk_test_tickethub');
-      const reference = `TH-${event.id}-${Date.now()}`;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          console.log(`[alpha] addebito tentativo ${attempt} ${reference} ${total}`);
-          charge = await alpha.charge({
-            amountCents: Math.round(total * 100),
-            currency: 'EUR',
-            reference,
-            card: body.card,
-          });
-          console.log(`[alpha] esito ${charge.status} ${charge.chargeId}`);
-          break;
-        } catch (err) {
-          if (err instanceof AlphaTimeoutError && attempt < 3) {
-            console.log('[alpha] timeout, riprovo');
-            continue;
+      if (this.provider === 'beta') {
+        const beta = new BetaPayments('tickethub');
+        const payment = await beta.createPayment({
+          amount: total.toFixed(2),
+          currencyCode: 'EUR',
+          orderRef: `TH-${event.id}-${Date.now()}`,
+          cardToken: body.card,
+        });
+        if (payment.outcome === 'REFUSED') throw new HttpException('pagamento rifiutato', 402);
+        paymentId = payment.id;
+      } else {
+        const alpha = new AlphaPayClient(process.env.ALPHA_API_KEY ?? 'sk_test_tickethub');
+        const reference = `TH-${event.id}-${Date.now()}`;
+        let charge: { chargeId: string; status: string } | null = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            console.log(`[alpha] addebito tentativo ${attempt} ${reference} ${total}`);
+            charge = await alpha.charge({
+              amountCents: Math.round(total * 100),
+              currency: 'EUR',
+              reference,
+              card: body.card,
+            });
+            console.log(`[alpha] esito ${charge.status} ${charge.chargeId}`);
+            break;
+          } catch (err) {
+            if (err instanceof AlphaTimeoutError && attempt < 3) {
+              console.log('[alpha] timeout, riprovo');
+              continue;
+            }
+            console.log('[alpha] errore', err);
+            throw new ServiceUnavailableException('servizio di pagamento non disponibile');
           }
-          console.log('[alpha] errore', err);
-          throw new ServiceUnavailableException('servizio di pagamento non disponibile');
         }
+        if (charge!.status === 'declined') throw new HttpException('pagamento rifiutato', 402);
+        paymentId = charge!.chargeId;
       }
-      if (charge!.status === 'declined') throw new HttpException('pagamento rifiutato', 402);
     }
 
     for (const it of items) {
@@ -121,7 +139,7 @@ export class OrdersController {
       items,
       total,
       status: 'paid',
-      alphaChargeId: charge ? charge.chargeId : null,
+      paymentId,
       createdAt: new Date().toISOString(),
     };
     this.orders.save(order);
@@ -151,23 +169,33 @@ export class OrdersController {
     const event = this.events.findById(order.eventId)!;
     const venue = this.venues.findById(event.venueId)!;
 
-    if (order.alphaChargeId) {
-      const client = new AlphaPayClient(process.env.ALPHA_API_KEY ?? 'sk_test_tickethub');
-      let done = false;
-      for (let attempt = 1; attempt <= 2 && !done; attempt++) {
+    if (order.paymentId) {
+      if (this.provider === 'beta') {
+        const beta = new BetaPayments('tickethub');
         try {
-          console.log(`[alpha] rimborso tentativo ${attempt} ${order.alphaChargeId}`);
-          await client.refund(order.alphaChargeId, Math.round(order.total * 100));
-          done = true;
+          await beta.reverse(order.paymentId, { amount: order.total.toFixed(2) });
         } catch (err) {
-          if (err instanceof AlphaTimeoutError) {
-            console.log('[alpha] timeout rimborso');
-            continue;
-          }
+          console.log('[beta] errore rimborso', err);
           throw new ServiceUnavailableException('rimborso non riuscito');
         }
+      } else {
+        const client = new AlphaPayClient(process.env.ALPHA_API_KEY ?? 'sk_test_tickethub');
+        let done = false;
+        for (let attempt = 1; attempt <= 2 && !done; attempt++) {
+          try {
+            console.log(`[alpha] rimborso tentativo ${attempt} ${order.paymentId}`);
+            await client.refund(order.paymentId, Math.round(order.total * 100));
+            done = true;
+          } catch (err) {
+            if (err instanceof AlphaTimeoutError) {
+              console.log('[alpha] timeout rimborso');
+              continue;
+            }
+            throw new ServiceUnavailableException('rimborso non riuscito');
+          }
+        }
+        if (!done) throw new ServiceUnavailableException('rimborso non riuscito');
       }
-      if (!done) throw new ServiceUnavailableException('rimborso non riuscito');
     }
 
     for (const it of order.items) {
