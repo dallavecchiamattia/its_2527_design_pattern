@@ -16,6 +16,16 @@ class FakeGateway implements PaymentGateway {
     async refund(): Promise<void> {}
 }
 
+class FailingRefundGateway implements PaymentGateway {
+    async charge(): Promise<Payment> {
+        return { id: 'p-1', approved: true };
+    }
+
+    async refund(): Promise<void> {
+        throw new PaymentTimeoutError();
+    }
+}
+
 describe('LoggingGateway', () => {
     let lines: string[];
     const log = (line: string) => lines.push(line);
@@ -45,6 +55,13 @@ describe('LoggingGateway', () => {
         const gateway = new LoggingGateway(new FakeGateway({ slowFirst: true }), log);
         await expect(gateway.charge(10, 'r', 'c')).rejects.toBeInstanceOf(PaymentTimeoutError);
         expect(lines[1]).toMatch(/^\[pagamenti\] addebito errore PaymentTimeoutError in \d+ ms$/);
+    });
+
+    it("scrive l'errore del rimborso e lo rilancia", async () => {
+        const gateway = new LoggingGateway(new FailingRefundGateway(), log);
+        await expect(gateway.refund('p-1', 10)).rejects.toBeInstanceOf(PaymentTimeoutError);
+        expect(lines[0]).toBe('[pagamenti] rimborso 10.00 p-1');
+        expect(lines[1]).toMatch(/^\[pagamenti\] rimborso errore PaymentTimeoutError in \d+ ms$/);
     });
     
     it('dentro RetryingGateway scrive ogni tentativo', async () => {
